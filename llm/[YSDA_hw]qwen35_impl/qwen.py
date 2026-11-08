@@ -271,7 +271,7 @@ class MLP(nn.Module):
         self.down_proj = nn.Linear(intermediate_size, config.hidden_size, bias=False)
 
     def forward(self, x):
-        raise NotImplementedError("TODO: implement MLP.forward")
+        return self.down_proj(torch.nn.functional.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
 # ============================================================================
@@ -371,7 +371,28 @@ class GatedDeltaNet(nn.Module):
         See homework.ipynb for the equations and dtype requirements.
         """
         batch_size, seq_len, _ = hidden_states.shape
-        raise NotImplementedError("TODO: implement GatedDeltaNet.forward")
+
+        qkv_proj = self.in_proj_qkv(hidden_states).transpose(1, 2)
+        qkv_conv = torch.nn.functional.silu(self.conv1d(qkv_proj)[..., :seq_len]).transpose(1, 2)
+
+        q, k, v = qkv_conv.split([self.key_dim, self.key_dim, self.value_dim], dim=-1)
+        q = q.view(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
+        q = q.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
+
+        k = k.view(batch_size, seq_len, self.num_k_heads, self.head_k_dim)
+        k = k.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
+
+        v = v.view(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
+
+        beta = torch.sigmoid(self.in_proj_b(hidden_states))
+        g = -torch.exp(self.A_log.float()) * torch.nn.functional.softplus(self.in_proj_a(hidden_states).float() + self.dt_bias.float())
+
+        core_attn_out = gated_delta_rule_recurrent(q, k, v, g, beta)
+
+        z = self.in_proj_z(hidden_states).view(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
+        norm_out = self.norm(core_attn_out, z).view(batch_size, seq_len, self.value_dim)
+
+        return self.out_proj(norm_out)
 
 
 # ============================================================================
@@ -398,7 +419,10 @@ class Qwen35DecoderLayer(nn.Module):
 
     def forward(self, hidden_states, position_embeddings, attention_mask=None):
         """Applies the two pre-LN residual connections; see homework.ipynb for the formula."""
-        raise NotImplementedError("TODO: implement Qwen35DecoderLayer.forward")
+        h = hidden_states + (self.self_attn(self.input_layernorm(hidden_states), position_embeddings, attention_mask) 
+                             if self.block_type == "full_attention" 
+                             else self.linear_attn(self.input_layernorm(hidden_states)))
+        return h + self.mlp(self.post_attention_layernorm(h))
 
 
 class Qwen35Model(nn.Module):
@@ -417,7 +441,13 @@ class Qwen35Model(nn.Module):
         input_ids: (batch, seq_len) int64
         Returns last_hidden_state: (batch, seq_len, hidden_size)
         """
-        raise NotImplementedError("TODO: implement Qwen35Model.forward")
+        x = self.embed_tokens(input_ids)
+        position_ids = torch.arange(0, input_ids.shape[-1], device=x.device).expand(x.shape[0], -1)
+        pos_embed= self.rotary_emb(x, position_ids)
+        mask = build_causal_mask(input_ids.shape[-1], x.dtype, x.device)
+        for layer in self.layers:
+            x = layer(x, pos_embed, mask)
+        return self.norm(x)
 
 
 class Qwen35ForCausalLM(nn.Module):
