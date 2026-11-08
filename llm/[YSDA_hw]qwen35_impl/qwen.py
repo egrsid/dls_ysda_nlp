@@ -470,7 +470,19 @@ class Qwen35ForCausalLM(nn.Module):
         `embed_tokens.weight` when tied -- so this works unchanged for both
         tied and untied checkpoints.
         """
-        raise NotImplementedError("TODO: implement Qwen35ForCausalLM.forward")
+
+        out = self.model(input_ids)
+        logits = self.lm_head(out)
+
+        if labels is not None:
+            criterion = nn.CrossEntropyLoss()
+            loss = criterion(logits.reshape(-1, logits.shape[-1]), labels.reshape(-1))
+        else:
+            loss = None
+
+        return logits, loss
+
+        
 
 
 # ============================================================================
@@ -491,7 +503,26 @@ def qwen35_config_from_hf(config: dict) -> Qwen35Config:
     # rope fields (rope_theta, partial_rotary_factor) live under a nested rope_scaling/rope_parameters dict
     # watch for tie_word_embeddings living at the top level, not under text_config
     # build and return Qwen35Config(**mapped_fields)
-    raise NotImplementedError("TODO: implement qwen35_config_from_hf")
+    text_config = config.get("text_config", config)
+    mapped_fields = {
+        field.name: text_config[field.name]
+        for field in dataclasses.fields(Qwen35Config)
+        if field.init and field.name in text_config
+    }
+
+    if "tie_word_embeddings" in config:
+        mapped_fields["tie_word_embeddings"] = config["tie_word_embeddings"]
+
+    if "mtp_num_hidden_layers" in text_config:
+        mapped_fields["mtp_num_layers"] = text_config["mtp_num_hidden_layers"]
+
+    for rope_config_key in ("rope_scaling", "rope_parameters"):
+        rope_config = text_config.get(rope_config_key) or {}
+        for field_name in ("rope_theta", "partial_rotary_factor"):
+            if field_name in rope_config:
+                mapped_fields[field_name] = rope_config[field_name]
+
+    return Qwen35Config(**mapped_fields)
 
 
 # ============================================================================
